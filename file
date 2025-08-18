@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+# Vehicle-Emission-Heatmap-Dashboard-for-Smart-Cities
+# ---------------------------------------------------
+# Streamlit dashboard that generates synthetic vehicle telemetry and
+# visualizes emissions as a city heatmap + charts.
+#
+# Run:
+#   pip install streamlit pandas numpy pydeck matplotlib openpyxl
+#   streamlit run vehicle_emission_heatmap_dashboard.py
+#
+# Notes:
+# - Uses a configurable city center (default: Lagos approx).
+# - Generates >100 points by default (5,000 synthetic samples).
+# - Switch pollutant, time window, and vehicle filters in the sidebar.
+
+import math
+import numpy as np
+import pandas as pd
+import streamlit as st
+import pydeck as pdk
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+
+st.set_page_config(page_title="Vehicle Emission Heatmap (Synthetic)", layout="wide")
+
+# -------------------------
+# Parameters / UI Controls
+# -------------------------
+with st.sidebar:
+    st.title("Controls")
+    st.caption("Synthetic data parameters")
+
+    seed = st.number_input("Random seed", value=42, step=1)
+    n_points = st.number_input("Number of samples", min_value=200, max_value=200000, value=5000, step=100)
+    city_name = st.text_input("City name (label only)", value="Lagos")
+    lat_center = st.number_input("City center latitude", value=6.5244, format="%.6f")
+    lon_center = st.number_input("City center longitude", value=3.3792, format="%.6f")
+
+    city_radius_km = st.slider("City radius (km)", 2.0, 25.0, 10.0, 0.5)
+
+    st.divider()
+    st.caption("Filter & visualize")
+    pollutant = st.selectbox("Pollutant", ["CO2_gps", "NO2_mgps", "CO_mgps", "PM25_mgps"])
+    hour_start, hour_end = st.slider("Hour filter", 0, 23, (6, 20))
+    vehicle_types_sel = st.multiselect("Vehicle types", ["car","bus","truck","motorcycle","ridehail"],
+                                       default=["car","bus","truck","motorcycle","ridehail"])
+    speed_range = st.slider("Speed filter (km/h)", 0, 140, (0, 120))
+
+    st.divider()
+    hex_radius = st.slider("Hex bin radius (m)", 50, 400, 120, 10)
+
+# --------------------------------
+# Helpers: geo & emission formulae
+# --------------------------------
+def km_to_deg_lat(km: float) -> float:
+    return km / 110.574
+
+def km_to_deg_lon(km: float, lat: float) -> float:
+    return km / (111.320 * math.cos(math.radians(lat)) + 1e-9)
+
+def synthetic_vehicle_data(n=5000, seed=42, lat0=6.5244, lon0=3.3792, radius_km=10.0, city_name="City"):
+    """
+    Generate synthetic GPS points, speeds, and emissions with realistic diurnal patterns.
+    Returns columns:
+      ['timestamp','lat','lon','speed_kph','vehicle_type','CO2_gps','NO2_mgps','CO_mgps','PM25_mgps','hour','city']
+    """
+    rng = np.random.default_rng(seed)
+
+    # Time base: one day sampled uniformly
+    t0 = datetime(2025, 1, 1, 0, 0, 0)
+    timestamps = np.array([t0 + timedelta(seconds=int(rng.uniform(0, 24*3600))) for _ in range(n)])
+
+    # Spatial distribution: denser core + spread ring
+    r = np.clip(rng.rayleigh(scale=radius_km/3, size=n), 0, radius_km)
+    theta = rng.uniform(0, 2*np.pi, size=n)
+    lat = lat0 + km_to_deg_lat(r * np.sin(theta))
+    lon = lon0 + km_to_deg_lon(r * np.cos(theta), lat0)
+
+    # Vehicle mix
+    veh_types = np.array(["car","bus","truck","motorcycle","ridehail"])
+    veh_probs = np.array([0.55, 0.08, 0.10, 0.17, 0.10])
+    vehicle = rng.choice(veh_types, size=n, p=veh_probs)
+
+    # Speed profile with rush-hour congestion
+    hours = np.array([ts.hour for ts in timestamps])
+    base_speed = rng.normal(45, 15, size=n)  # kph
+    congestion = (
+        np.exp(-0.5*((hours-8)/1.4)**2) +
+        np.exp(-0.5*((hours-17)/1.6)**2)
+    )
+    speed_kph = np.clip(base_speed - 25*congestion + rng.normal(0, 6, n), 0, 130)
+
+    # Emission factors (synthetic)
+    type_factor = np.select(
+        [vehicle=="car", vehicle=="bus", vehicle=="truck", vehicle=="motorcycle", vehicle=="ridehail"],
+        [1.0,            2.2,            2.8,             0.6,                 1.1],
+        default=1.0
+    )
+    cong_factor = 1.0 + np.clip((35 - speed_kph)/25, 0, 1.5)
+
+    CO2_gps = np.clip((0.6 + 0.02*speed_kph) * type_factor * cong_factor + rng.normal(0, 0.05, n), 0.05, None)
+    NO2_mgps = np.clip(12 + 1.2*CO2_gps + rng.normal(0, 1.5, n), 0.0, None)
+    CO_mgps  = np.clip(80 + 5.0*CO2_gps + rng.normal(0, 5.0, n), 0.0, None)
+    PM25_mgps= np.clip(2.5 + 0.4*CO2_gps + rng.normal(0, 0.6, n), 0.0, None)
+
+    df = pd.DataFrame({
+        "timestamp": timestamps,
+        "lat": lat,
+        "lon": lon,
+        "speed_kph": speed_kph,
+        "vehicle_type": vehicle,
+        "CO2_gps": CO2_gps,
+        "NO2_mgps": NO2_mgps,
+        "CO_mgps": CO_mgps,
+        "PM25_mgps": PM25_mgps,
+        "hour": hours,
+        "city": city_name,
+    })
+    return df
+
+# --------------------
+# Generate the Data
+# --------------------
+df = synthetic_vehicle_data(
+    n=int(n_points),
+    seed=int(seed),
+    lat0=float(lat_center),
+    lon0=float(lon_center),
+    radius_km=float(city_radius_km),
+    city_name=city_name
+)
+
+# Apply filters
+mask = (
+    (df["hour"] >= hour_start) & (df["hour"] <= hour_end) &
+    (df["vehicle_type"].isin(vehicle_types_sel)) &
+    (df["speed_kph"].between(speed_range[0], speed_range[1]))
+)
+df_f = df.loc[mask].copy()
+
+# --------------------
+# KPIs
+# --------------------
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Samples (filtered)", f"{len(df_f):,}")
+col2.metric("Avg Speed (km/h)", f"{df_f['speed_kph'].mean():.1f}" if len(df_f) else "—")
+col3.metric(f"Total {pollutant}", f"{df_f[pollutant].sum():,.0f}" if len(df_f) else "—")
+col4.metric(f"Peak hour ({pollutant})", int(df_f.groupby('hour')[pollutant].sum().idxmax()) if len(df_f)>0 else "—")
+
+# --------------------
+# Map (HexagonLayer)
+# --------------------
+st.subheader(f"{city_name} — {pollutant} heatmap")
+if len(df_f) == 0:
+    st.info("No data after filters. Adjust filters in the sidebar.")
+else:
+    layer = pdk.Layer(
+        "HexagonLayer",
+        data=df_f,
+        get_position='[lon, lat]',
+        auto_highlight=True,
+        elevation_scale=8,
+        pickable=True,
+        elevation_range=[0, 4000],
+        extruded=True,
+        coverage=1,
+        radius=int(hex_radius),
+        get_elevation_weight=pollutant,
+        elevation_aggregation='SUM',
+        get_color_weight=pollutant,
+        color_aggregation='MEAN'
+    )
+    view_state = pdk.ViewState(latitude=df_f["lat"].mean(), longitude=df_f["lon"].mean(), zoom=11, pitch=40)
+    tooltip = {"html": "<b>Sum {{"+pollutant+"}}</b>: {elevationValue}<br/>Count: {points.length}", "style": {"color": "white"}}
+    st.pydeck_chart(pdk.Deck(layers=[layer], initial_view_state=view_state, tooltip=tooltip))
+
+# --------------------
+# Charts
+# --------------------
+c1, c2 = st.columns((2,1))
+
+with c1:
+    st.markdown("### Emissions by Hour")
+    if len(df_f):
+        by_hour = df_f.groupby("hour")[pollutant].sum().reindex(range(24), fill_value=0)
+        fig, ax = plt.subplots(figsize=(7,3))
+        ax.plot(by_hour.index, by_hour.values, marker="o")
+        ax.set_xlabel("Hour of day")
+        ax.set_ylabel(pollutant)
+        ax.grid(True, alpha=0.3)
+        st.pyplot(fig)
+    else:
+        st.info("No data to plot.")
+
+with c2:
+    st.markdown("### By Vehicle Type")
+    if len(df_f):
+        by_type = df_f.groupby("vehicle_type")[pollutant].sum().sort_values(ascending=False)
+        st.bar_chart(by_type)
+    else:
+        st.info("No data to plot.")
+
+# Raw data expander
+with st.expander("Preview filtered data (first 200 rows)"):
+    st.dataframe(df_f.head(200))
+
+# Download buttons
+@st.cache_data
+def to_csv(df):
+    return df.to_csv(index=False).encode("utf-8")
+
+@st.cache_data
+def to_excel_bytes(df):
+    try:
+        import io
+        from pandas import ExcelWriter
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="data")
+        return buffer.getvalue()
+    except Exception:
+        return None
+
+st.download_button("Download filtered CSV", data=to_csv(df_f),
+                   file_name="vehicle_emissions_filtered.csv", mime="text/csv")
+excel_bytes = to_excel_bytes(df_f)
+if excel_bytes is not None:
+    st.download_button("Download filtered Excel", data=excel_bytes,
+                       file_name="vehicle_emissions_filtered.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+else:
+    st.caption("Install openpyxl to enable Excel export.")
+
+st.caption("Note: All data are synthetic and for demonstration purposes only.")
