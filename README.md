@@ -79,6 +79,8 @@ Testing emission reduction policies.
 Demonstrating IoT mobility dashboards.
 
 Educational use for data visualization and geospatial analytics.
+AUthor [ Name: Agbozu Ebingiye Nelvin
+         Github: https://github.com/Nelvinebi/ ]
 
 License
 
